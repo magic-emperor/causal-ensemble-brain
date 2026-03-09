@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════
+# Render Deployment Config — Causal Paper Scout
+#
+# Service type: worker (Background Worker)
+# WHY worker not web: web services spin down after 15 min of
+# inactivity. Workers run 24/7 — required for our 55-min loop.
+#
+# Database: PostgreSQL 16 (pgvector requires Postgres 15+)
+# ═══════════════════════════════════════════════════════════
+
+services:
+  - type: worker
+    name: causal-paper-scout
+    runtime: python
+    repo: https://github.com/magic-emperor/causal-ensemble-brain
+    branch: main
+    buildCommand: pip install -r requirements_scout.txt
+    startCommand: python causal_paper_scout.py
+    plan: free
+    envVars:
+      # Render auto-populates this from the database block below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: causal-scout-db
+          property: connectionString
+      # Which brain config to run (matches key in PAPER_TRADE_CONFIGS)
+      - key: PAPER_SCOUT_BRAIN
+        value: causal_ensemble
+      # Scan interval in minutes
+      - key: PAPER_SCOUT_INTERVAL_MIN
+        value: "55"
+      # ICICI Breeze — add real values in Render dashboard (sync: false = manual)
+      - key: BREEZE_API_KEY
+        sync: false
+      - key: BREEZE_SECRET
+        sync: false
+      - key: BREEZE_SESSION_TOKEN
+        sync: false
+
+databases:
+  - name: causal-scout-db
+    databaseName: causal_scout
+    plan: free
+    postgresMajorVersion: 16

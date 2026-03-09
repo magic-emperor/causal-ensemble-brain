@@ -368,24 +368,84 @@ class BrainPrediction(Base):
     )
 
 
+class PaperTradeSignal(Base):
+    """
+    PATCH: Paper Trade Signal Tracking Table.
+    Added for causal_paper_scout.py — self-contained, no external deps.
+
+    Each row = one brain signal fired during paper trading.
+    The scout's resolve_paper_signals() method updates outcome
+    when T1 or SL is hit, or when the signal expires after 8 hours.
+
+    outcome values:
+        NULL     = still open (not yet resolved)
+        T1_HIT   = price hit target_1  → WIN
+        SL_HIT   = price hit stop_loss → LOSS
+        EXPIRED  = 8h elapsed, neither T1 nor SL was hit
+
+    pnl_r is profit/loss measured in R-multiples:
+        WIN:     pnl_r = abs(T1 - entry) / abs(entry - SL)   e.g. +2.5
+        LOSS:    pnl_r = -1.0  (always -1R by definition)
+        EXPIRED: pnl_r = signed move / SL-distance
+    """
+    __tablename__ = "paper_trade_signals"
+
+    id          = Column(Integer,    primary_key=True)
+    brain_name  = Column(String(50), nullable=False, index=True)
+    symbol      = Column(String(20), nullable=False, index=True)
+    direction   = Column(String(5),  nullable=False)           # BUY or SELL
+    entry_price = Column(SAFloat,    nullable=False)
+    target_1    = Column(SAFloat,    nullable=False)
+    target_2    = Column(SAFloat,    nullable=True)
+    stop_loss   = Column(SAFloat,    nullable=False)
+    confidence  = Column(SAFloat,    nullable=True)
+    regime      = Column(String(30), nullable=True)
+    timeframe   = Column(String(10), nullable=True)            # '1h', '4h'
+    strategy    = Column(String(50), nullable=True)
+    outcome     = Column(String(10), nullable=True)            # NULL/T1_HIT/SL_HIT/EXPIRED
+    exit_price  = Column(SAFloat,    nullable=True)
+    pnl_r       = Column(SAFloat,    nullable=True)
+    created_at  = Column(DateTime,   default=datetime.utcnow, nullable=False, index=True)
+    resolved_at = Column(DateTime,   nullable=True)
+
+    __table_args__ = (
+        Index("idx_pts_brain_open",  "brain_name", "outcome"),
+        Index("idx_pts_symbol_time", "symbol",     "created_at"),
+    )
+
+
 class PostgresStorage:
     def __init__(self, connection_string=None):
         if not connection_string:
-            user = os.getenv("DB_USER", "agent_user")
-            password = os.getenv("DB_PASSWORD", "agent_password")
-            host = os.getenv("DB_HOST", "localhost")
-            port = os.getenv("DB_PORT", "5433")
-            db_name = os.getenv("DB_NAME", "market_data")
-            connection_string = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
-        
+            # ── PATCH: DATABASE_URL support (required for Render) ──────────────────
+            # Render provides a single DATABASE_URL env var. The original code
+            # expected five separate vars (DB_USER, DB_PASSWORD, etc.) which
+            # Render does not set. This patch checks DATABASE_URL first.
+            # Render uses postgres:// prefix; SQLAlchemy requires postgresql://.
+            # Priority: DATABASE_URL → individual vars → hardcoded local defaults.
+            database_url = os.getenv("DATABASE_URL")
+            if database_url:
+                connection_string = database_url.replace(
+                    "postgres://", "postgresql://", 1
+                )
+            else:
+                user     = os.getenv("DB_USER",     "agent_user")
+                password = os.getenv("DB_PASSWORD", "agent_password")
+                host     = os.getenv("DB_HOST",     "localhost")
+                port     = os.getenv("DB_PORT",     "5433")
+                db_name  = os.getenv("DB_NAME",     "market_data")
+                connection_string = (
+                    f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+                )
+
         self.engine = create_engine(connection_string)
         self.Session = sessionmaker(bind=self.engine)
-        
-        # Enable pgvector extension
+
+        # Enable pgvector extension (requires Postgres 15+ — use 16 on Render)
         with self.engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             conn.commit()
-            
+
         Base.metadata.create_all(self.engine)
         # logger.info("database_initialized") # Silenced to prevent Windows OSError [Errno 22]
 
@@ -1167,6 +1227,231 @@ class PostgresStorage:
         except Exception as e:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+
+    # ═══════════════════════════════════════════════════════════════
+    # PAPER TRADE SIGNAL METHODS  (added for causal_paper_scout.py)
+    # Self-contained — no dependency on market_agent.learning
+    # ═══════════════════════════════════════════════════════════════
+
+    def store_paper_signal(
+        self,
+        brain_name: str,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        target_1: float,
+        stop_loss: float,
+        target_2: float = None,
+        confidence: float = None,
+        regime: str = None,
+        timeframe: str = None,
+        strategy: str = "Paper-Trade",
+    ) -> Optional[int]:
+        """
+        Store one new paper trade signal. Returns DB row id or None on failure.
+        outcome is NULL (open) until resolve_paper_signals() processes it.
+        """
+        session = self.Session()
+        try:
+            sig = PaperTradeSignal(
+                brain_name  = brain_name,
+                symbol      = symbol,
+                direction   = direction,
+                entry_price = entry_price,
+                target_1    = target_1,
+                target_2    = target_2,
+                stop_loss   = stop_loss,
+                confidence  = confidence,
+                regime      = regime,
+                timeframe   = timeframe,
+                strategy    = strategy,
+            )
+            session.add(sig)
+            session.commit()
+            logger.info(
+                "paper_signal_stored",
+                brain=brain_name, symbol=symbol,
+                direction=direction, entry=round(entry_price, 4), id=sig.id,
+            )
+            return sig.id
+        except Exception as e:
+            session.rollback()
+            logger.error("store_paper_signal_failed", symbol=symbol, error=str(e))
+            return None
+        finally:
+            session.close()
+
+    def resolve_paper_signals(self, symbol: str, current_price: float) -> int:
+        """
+        Check all open paper signals for this symbol against current_price.
+        Called every cycle by causal_paper_scout.py BEFORE the scan.
+
+        Resolution logic:
+            BUY  signal:  T1_HIT if price >= target_1  |  SL_HIT if price <= stop_loss
+            SELL signal:  T1_HIT if price <= target_1  |  SL_HIT if price >= stop_loss
+            Any signal older than 8 hours that is still open → EXPIRED
+
+        pnl_r (R-multiple):
+            T1_HIT  : abs(target_1 - entry) / abs(entry - stop_loss)   e.g. +2.5
+            SL_HIT  : -1.0  (always)
+            EXPIRED : signed price move / SL distance
+
+        Returns count of signals resolved this call.
+        """
+        session = self.Session()
+        resolved = 0
+        try:
+            open_sigs = (
+                session.query(PaperTradeSignal)
+                .filter(
+                    PaperTradeSignal.symbol  == symbol,
+                    PaperTradeSignal.outcome.is_(None),
+                )
+                .all()
+            )
+
+            for sig in open_sigs:
+                entry   = sig.entry_price
+                t1      = sig.target_1
+                sl      = sig.stop_loss
+                sl_dist = abs(entry - sl)
+                if sl_dist <= 0:
+                    continue  # degenerate signal — skip
+
+                outcome    = None
+                exit_price = None
+                pnl_r      = None
+
+                if sig.direction == "BUY":
+                    if current_price >= t1:
+                        outcome    = "T1_HIT"
+                        exit_price = t1
+                        pnl_r      = abs(t1 - entry) / sl_dist
+                    elif current_price <= sl:
+                        outcome    = "SL_HIT"
+                        exit_price = sl
+                        pnl_r      = -1.0
+                elif sig.direction == "SELL":
+                    if current_price <= t1:
+                        outcome    = "T1_HIT"
+                        exit_price = t1
+                        pnl_r      = abs(t1 - entry) / sl_dist
+                    elif current_price >= sl:
+                        outcome    = "SL_HIT"
+                        exit_price = sl
+                        pnl_r      = -1.0
+
+                # Expiry: 8 hours with no resolution → close at current price
+                if outcome is None:
+                    age_h = (
+                        datetime.utcnow() - sig.created_at
+                    ).total_seconds() / 3600
+                    if age_h >= 8:
+                        outcome    = "EXPIRED"
+                        exit_price = current_price
+                        if sig.direction == "BUY":
+                            pnl_r = (current_price - entry) / sl_dist
+                        else:
+                            pnl_r = (entry - current_price) / sl_dist
+
+                if outcome:
+                    sig.outcome     = outcome
+                    sig.exit_price  = exit_price
+                    sig.pnl_r       = round(pnl_r, 4) if pnl_r is not None else None
+                    sig.resolved_at = datetime.utcnow()
+                    resolved += 1
+                    logger.info(
+                        "paper_signal_resolved",
+                        symbol=symbol, signal_id=sig.id,
+                        outcome=outcome, pnl_r=sig.pnl_r,
+                    )
+
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error("resolve_paper_signals_failed", symbol=symbol, error=str(e))
+        finally:
+            session.close()
+        return resolved
+
+    def get_paper_trade_performance(self, brain_name: str) -> dict:
+        """
+        Return cumulative paper trade stats for a brain — used by the
+        performance report printed every 3 cycles.
+
+        Returns dict with:
+            total, wins, losses, decided, wr, total_r, ev, max_dd, open, recent
+        """
+        session = self.Session()
+        try:
+            rows = (
+                session.query(PaperTradeSignal)
+                .filter(
+                    PaperTradeSignal.brain_name == brain_name,
+                    PaperTradeSignal.outcome.isnot(None),
+                )
+                .order_by(PaperTradeSignal.created_at.asc())
+                .all()
+            )
+
+            total   = len(rows)
+            wins    = sum(1 for r in rows if r.outcome == "T1_HIT")
+            losses  = sum(1 for r in rows if r.outcome == "SL_HIT")
+            decided = wins + losses   # EXPIRED excluded from WR calc
+            wr      = wins / decided  if decided > 0 else 0.0
+            total_r = sum(r.pnl_r    for r in rows if r.pnl_r is not None)
+            ev      = total_r / total if total   > 0 else 0.0
+
+            # Max drawdown in R (peak-to-trough of cumulative R curve)
+            cumulative = 0.0
+            peak       = 0.0
+            max_dd     = 0.0
+            for r in rows:
+                if r.pnl_r is not None:
+                    cumulative += r.pnl_r
+                    if cumulative > peak:
+                        peak = cumulative
+                    dd = peak - cumulative
+                    if dd > max_dd:
+                        max_dd = dd
+
+            open_count = (
+                session.query(PaperTradeSignal)
+                .filter(
+                    PaperTradeSignal.brain_name == brain_name,
+                    PaperTradeSignal.outcome.is_(None),
+                )
+                .count()
+            )
+
+            return {
+                "total":   total,
+                "wins":    wins,
+                "losses":  losses,
+                "decided": decided,
+                "wr":      wr,
+                "total_r": round(total_r, 3),
+                "ev":      round(ev, 4),
+                "max_dd":  round(max_dd, 3),
+                "open":    open_count,
+                "recent":  [
+                    {
+                        "symbol":    r.symbol,
+                        "direction": r.direction,
+                        "outcome":   r.outcome,
+                        "pnl_r":     r.pnl_r,
+                        "regime":    r.regime,
+                        "created_at": r.created_at,
+                    }
+                    for r in rows[-10:]
+                ],
+            }
+        except Exception as e:
+            logger.error("get_paper_performance_failed", error=str(e))
+            return {}
         finally:
             session.close()
 

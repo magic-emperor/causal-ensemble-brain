@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════
+# Causal-Ensemble Paper Scout — Python Dependencies
+#
+# NO torch. NO sentence-transformers. NO heavy ML.
+# Estimated Render RAM usage: ~150 MB (well within 512 MB free tier)
+#
+# Install locally:
+#     pip install -r requirements_scout.txt
+# ═══════════════════════════════════════════════════════════
+
+# Data fetching — covers US, NSE, FX, commodities, crypto
+yfinance==0.2.51
+
+# Data processing
+pandas==2.2.3
+numpy==1.26.4
+
+# Database — PostgreSQL + pgvector
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+
+# Logging
+structlog==24.4.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# HTTP (used internally by yfinance and sqlalchemy)
+requests==2.32.3
