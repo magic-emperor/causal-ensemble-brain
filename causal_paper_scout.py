@@ -24,7 +24,9 @@ HOW TO RUN LOCALLY:
   python causal_paper_scout.py
 
 HOW TO DEPLOY ON RENDER:
-  Deployed as a Background Worker via render.yaml.
+  Deployed as a FREE Web Service via render.yaml.
+  A health server runs on PORT (set by Render) so UptimeRobot can
+  ping /health every 5 min to prevent the free tier from spinning down.
   Set DATABASE_URL in Render Environment tab.
 """
 
@@ -34,6 +36,7 @@ import os
 import sys
 import time
 import importlib
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
@@ -506,12 +509,56 @@ def _run_scan_cycle(config: Dict, storage, tracker: SessionTracker,
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+# HEALTH SERVER — keeps Render Free Web Service alive
+#
+# Render free Web Services spin down after 15 min of inactivity.
+# This tiny HTTP server answers GET / and GET /health so that
+# UptimeRobot can ping it every 5 minutes and prevent spin-down.
+#
+# Uses Python's built-in http.server — ZERO new dependencies.
+# Runs in a daemon thread so it never blocks the scanning loop.
+#
+# Port: read from PORT env var (Render sets this automatically).
+#       Falls back to 8080 for local testing.
+# ═══════════════════════════════════════════════════════════
+
+def _start_health_server():
+    """
+    Start a minimal HTTP health server in a background daemon thread.
+    Responds 200 OK to any GET request with a plain-text status line.
+    Called once at startup — before the main scanning loop begins.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"causal-paper-scout: alive\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass   # silence per-request access logs — keep Render logs clean
+
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"  ✅ Health server running on port {port}  (UptimeRobot target: /health)")
+
+
 def start_scout(brain_key: str = ACTIVE_BRAIN_KEY,
                 interval_minutes: int = INTERVAL_MINUTES):
     """
     Main entry point. Runs forever until stopped.
     Render Background Worker keeps this running 24/7 without spinning down.
     """
+    # ── Start health server (keeps Render free tier alive) ───────
+    _start_health_server()
+
     # ── Validate brain key ────────────────────────────────────────
     config = PAPER_TRADE_CONFIGS.get(brain_key)
     if not config:
