@@ -179,55 +179,38 @@ def _is_market_open(symbol: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# DATA FETCHING — yfinance with in-cycle caching
+# DATA FETCHING — 2-tier waterfall, tested locally before deploy
+#
+# WHAT WE LEARNED FROM LOCAL TESTING (test_data_tiers.py):
+#
+#   Tier 1 — ScraperAPI + curl_cffi session  ← PRIMARY
+#     Modern yfinance (>=0.2.50) requires curl_cffi, not requests.Session.
+#     ScraperAPI routes through residential IPs that Yahoo does not block.
+#     Requires: SCRAPER_API_KEY env var + curl_cffi in requirements.
+#
+#   Tier 2 — plain yfinance                  ← FALLBACK
+#     Works perfectly locally. May fail on Render cloud IPs (Yahoo blocks).
+#     No key needed. Used when ScraperAPI key missing or quota exhausted.
+#     If this also fails on Render, symbol is skipped this cycle — not fatal.
+#
+#   REMOVED — Finnhub:
+#     403 on free tier. OHLCV candles require paid plan. Not viable.
+#
+#   REMOVED — yfinance + requests.Session:
+#     yfinance now rejects requests.Session. Needs curl_cffi. Removed.
 # ═══════════════════════════════════════════════════════════
 
 _cache: Dict[str, Dict] = {}
 _CACHE_TTL_MINUTES = 50   # re-use fetched data within same 55-min cycle
 
 # ── ScraperAPI quota guard ────────────────────────────────────────────────────
-# Free tier: 1,000 credits/month (5,000 in first 7 days of trial).
-# Our usage: 13 symbols × ~26 cycles/day = ~338 calls/day.
-# Guard: track daily usage in-process. When SCRAPER_DAILY_LIMIT is hit,
-# ScraperAPI is skipped for the rest of the day and Tier 2 takes over.
-# This prevents silent quota exhaustion — you will see a log warning instead.
-_SCRAPER_DAILY_LIMIT   = int(os.getenv("SCRAPER_DAILY_LIMIT", "900"))  # conservative
-_scraper_calls_today   = 0
-_scraper_reset_date    = datetime.now(timezone.utc).date()
-
-# ── Finnhub interval map: our intervals → Finnhub resolution codes ────────────
-# Finnhub free tier: 60 calls/min, covers US stocks + FX + commodities.
-# Does NOT cover NSE Indian stocks (.NS) on free tier — yfinance handles those.
-_FINNHUB_RESOLUTION = {"1h": "60", "4h": "240", "1d": "D"}
-
-# ── Symbols Finnhub can serve (US equities, FX, commodities) ─────────────────
-# Indian stocks (.NS / .BO) are NOT on Finnhub free tier — excluded here.
-_FINNHUB_SYMBOLS = {
-    # US equities — use symbol as-is
-    "AAPL", "AMD", "NVDA", "GOOGL", "MSFT", "META", "AMZN", "TSLA",
-    # FX — Finnhub uses OANDA: format e.g. "OANDA:GBP_JPY"
-    "GBPJPY=X",
-    # Commodities — Finnhub futures format e.g. "COMEX:GC1!"
-    "GC=F",
-}
-
-# ── Finnhub symbol translation ────────────────────────────────────────────────
-_FINNHUB_SYMBOL_MAP = {
-    "GBPJPY=X": "OANDA:GBP_JPY",
-    "GC=F":     "COMEX:GC1!",
-}
-
-
-def _to_finnhub_symbol(symbol: str) -> str:
-    """Translate our yfinance-style symbol to Finnhub format."""
-    return _FINNHUB_SYMBOL_MAP.get(symbol, symbol)
+_SCRAPER_DAILY_LIMIT = int(os.getenv("SCRAPER_DAILY_LIMIT", "900"))
+_scraper_calls_today = 0
+_scraper_reset_date  = datetime.now(timezone.utc).date()
 
 
 def _scraper_quota_ok() -> bool:
-    """
-    Returns True if ScraperAPI daily quota has not been exhausted.
-    Resets the counter at UTC midnight automatically.
-    """
+    """Returns True if ScraperAPI daily quota not yet exhausted. Resets at UTC midnight."""
     global _scraper_calls_today, _scraper_reset_date
     today = datetime.now(timezone.utc).date()
     if today != _scraper_reset_date:
@@ -239,28 +222,16 @@ def _scraper_quota_ok() -> bool:
 
 def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
     """
-    Tier 1 — ScraperAPI proxy routing yfinance through a residential IP.
+    TIER 1 — ScraperAPI proxy with curl_cffi session.
 
-    ScraperAPI wraps any URL in a proxy that looks like a real browser.
-    We pass the Yahoo Finance history URL through it so Yahoo cannot
-    detect we are on a cloud server.
+    WHY curl_cffi:
+      Modern yfinance (>=0.2.50) internally uses curl_cffi for HTTP and
+      rejects plain requests.Session with 'Yahoo API requires curl_cffi session'.
+      We create a curl_cffi session configured with ScraperAPI's proxy so
+      yfinance routes all Yahoo requests through a residential IP.
 
-    HOW THE PROXY IS SET:
-    yfinance uses urllib3 internally and does NOT respect session.proxies
-    or session.verify when passed a custom requests.Session. The correct
-    approach is to set HTTP_PROXY / HTTPS_PROXY as process-level environment
-    variables before calling yfinance, then restore the originals after.
-    This is the only method that reliably works with yfinance on cloud servers.
-
-    Free tier  : 1,000 credits/month  (5,000 in first 7-day trial)
-    Paid tier  : from $49/month for 250,000 credits
-    Quota guard: _scraper_calls_today is incremented per call and checked
-                 before every request. When limit is hit, this function
-                 returns None immediately and Tier 2 takes over — no crash,
-                 no silent failure. A warning is logged once per day.
-
-    Requires SCRAPER_API_KEY env var. Returns None immediately if missing.
-    Covers    : all 13 symbols (same as yfinance — it IS yfinance via proxy).
+    Quota guard: auto-falls to Tier 2 when daily limit hit.
+    Requires: SCRAPER_API_KEY env var.
     """
     global _scraper_calls_today
 
@@ -273,27 +244,20 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
                        limit=_SCRAPER_DAILY_LIMIT, used=_scraper_calls_today)
         return None
 
-    proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-
-    # Save originals to restore after — never leave proxy set globally
-    orig_http  = os.environ.get("HTTP_PROXY",  "")
-    orig_https = os.environ.get("HTTPS_PROXY", "")
-
     try:
-        # Set proxy at process level — the only way yfinance/urllib3 respects it
-        os.environ["HTTP_PROXY"]  = proxy_url
-        os.environ["HTTPS_PROXY"] = proxy_url
+        from curl_cffi import requests as curl_requests
 
-        # Disable SSL verification for ScraperAPI's self-signed cert
-        import ssl
-        _orig_ctx = ssl._create_default_https_context
-        ssl._create_default_https_context = ssl._create_unverified_context
+        proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
 
-        try:
-            df = yf.Ticker(symbol).history(period=period, interval=interval)
-        finally:
-            # Always restore SSL context even if yfinance throws
-            ssl._create_default_https_context = _orig_ctx
+        # curl_cffi session — the only session type yfinance accepts
+        session = curl_requests.Session(
+            proxies={"http": proxy_url, "https": proxy_url},
+            verify=False,   # ScraperAPI uses self-signed cert
+            impersonate="chrome110",  # mimics real browser TLS fingerprint
+        )
+
+        ticker = yf.Ticker(symbol, session=session)
+        df = ticker.history(period=period, interval=interval)
 
         if df is None or df.empty:
             return None
@@ -309,136 +273,25 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
 
         _scraper_calls_today += 1
         logger.debug("scraper_ok", symbol=symbol, bars=len(df),
-                     calls_today=_scraper_calls_today, limit=_SCRAPER_DAILY_LIMIT)
+                     calls_today=_scraper_calls_today)
         return df
 
+    except ImportError:
+        logger.warning("curl_cffi_missing",
+                       msg="Install curl_cffi in requirements_scout.txt")
+        return None
     except Exception as e:
-        logger.debug("scraper_failed", symbol=symbol, error=str(e)[:80])
-        return None
-
-    finally:
-        # Always restore original proxy env vars
-        if orig_http:
-            os.environ["HTTP_PROXY"]  = orig_http
-        else:
-            os.environ.pop("HTTP_PROXY",  None)
-        if orig_https:
-            os.environ["HTTPS_PROXY"] = orig_https
-        else:
-            os.environ.pop("HTTPS_PROXY", None)
-
-
-def _fetch_finnhub(symbol: str, interval: str, bars: int = 60) -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV from Finnhub REST API.
-
-    Free tier: 60 calls/minute. Official API — not a scraper, not blocked on Render.
-    Covers: US equities, FX (via OANDA), commodities (via COMEX).
-    Does NOT cover: NSE Indian stocks (.NS) on free tier.
-
-    Returns a DataFrame with columns [Open, High, Low, Close, Volume] or None.
-    Requires FINNHUB_API_KEY env var. If key is missing, returns None immediately.
-    """
-    api_key = os.getenv("FINNHUB_API_KEY", "")
-    if not api_key:
-        return None
-
-    resolution = _FINNHUB_RESOLUTION.get(interval)
-    if not resolution:
-        return None
-
-    fh_symbol = _to_finnhub_symbol(symbol)
-
-    now  = int(time.time())
-    # Request enough history: bars × seconds_per_bar + 20% buffer
-    secs_per_bar = {"60": 3600, "240": 14400, "D": 86400}.get(resolution, 3600)
-    from_ts = now - int(bars * secs_per_bar * 1.2)
-
-    try:
-        url = "https://finnhub.io/api/v1/stock/candle"
-        # For FX use forex/candle, for crypto use crypto/candle
-        if "OANDA:" in fh_symbol:
-            url = "https://finnhub.io/api/v1/forex/candle"
-        elif "COMEX:" in fh_symbol or "NYMEX:" in fh_symbol:
-            url = "https://finnhub.io/api/v1/stock/candle"   # futures use stock endpoint
-
-        resp = requests.get(url, params={
-            "symbol":     fh_symbol,
-            "resolution": resolution,
-            "from":       from_ts,
-            "to":         now,
-            "token":      api_key,
-        }, timeout=10)
-
-        if resp.status_code != 200:
-            logger.debug("finnhub_http_error", symbol=symbol, status=resp.status_code)
-            return None
-
-        data = resp.json()
-        if data.get("s") != "ok" or not data.get("c"):
-            logger.debug("finnhub_no_data", symbol=symbol, status=data.get("s"))
-            return None
-
-        df = pd.DataFrame({
-            "Open":   data["o"],
-            "High":   data["h"],
-            "Low":    data["l"],
-            "Close":  data["c"],
-            "Volume": data.get("v", [0] * len(data["c"])),
-        }, index=pd.to_datetime(data["t"], unit="s"))
-
-        df.dropna(inplace=True)
-        if len(df) < 30:
-            return None
-
-        logger.debug("finnhub_ok", symbol=symbol, bars=len(df))
-        return df
-
-    except Exception as e:
-        logger.debug("finnhub_failed", symbol=symbol, error=str(e)[:80])
-        return None
-
-
-def _fetch_yfinance_with_session(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-    """
-    Fetch from yfinance using a fresh requests.Session with browser-like headers.
-
-    WHY THIS WORKS:
-    The Render block is a cookie/crumb issue — Yahoo returns empty JSON when
-    the request looks like a bare script. Passing Accept + User-Agent headers
-    that mimic a real browser often bypasses the block without any proxy.
-    This is the lightest-weight fix — no proxy service, no API key.
-    """
-    try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        ticker = yf.Ticker(symbol, session=session)
-        df = ticker.history(period=period, interval=interval)
-
-        if df is None or df.empty:
-            return None
-
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.dropna(inplace=True)
-        return df if len(df) >= 30 else None
-
-    except Exception:
+        logger.debug("scraper_failed", symbol=symbol, error=str(e)[:120])
         return None
 
 
 def _fetch_yfinance_plain(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-    """Plain yfinance call — last resort. Works locally, may be blocked on Render."""
+    """
+    TIER 2 — Plain yfinance, no proxy, no session override.
+
+    Works locally. May be blocked by Yahoo on Render cloud IPs.
+    If blocked, symbol is skipped this cycle — not fatal.
+    """
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval)
         if df is None or df.empty:
@@ -448,37 +301,18 @@ def _fetch_yfinance_plain(symbol: str, interval: str, period: str) -> Optional[p
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.dropna(inplace=True)
         return df if len(df) >= 30 else None
-    except Exception:
+    except Exception as e:
+        logger.debug("yf_plain_failed", symbol=symbol, error=str(e)[:80])
         return None
 
 
 def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
     """
-    4-TIER DATA WATERFALL — tries each source in order, returns first success.
-    All tiers share the same 50-minute cache — whichever wins is reused.
+    2-TIER DATA WATERFALL — tries each source in order, returns first success.
+    All tiers share the 50-minute cache — whichever wins is reused next cycle.
 
-    TIER 1 — ScraperAPI proxy (primary)
-        Routes yfinance through a residential proxy so Yahoo cannot detect
-        a cloud server. Covers all 13 symbols. Requires SCRAPER_API_KEY.
-        Daily quota guard: auto-falls to Tier 2 when limit is hit.
-        Free: 1,000/month. Trial: 5,000 in first 7 days.
-
-    TIER 2 — Finnhub REST API (first fallback)
-        Official cloud-friendly API, never blocked on Render.
-        Free tier: 60 calls/min — well above our usage.
-        Covers: US equities + FX (OANDA) + commodities (COMEX).
-        Does NOT cover Indian stocks (.NS) — those fall to Tier 3.
-        Requires FINNHUB_API_KEY.
-
-    TIER 3 — yfinance + browser session headers (second fallback)
-        Passes browser-like User-Agent/Accept headers with a fresh session.
-        Bypasses Yahoo's cookie/crumb block in most cases. No API key needed.
-        Covers all 13 symbols. Free forever.
-
-    TIER 4 — plain yfinance (last resort)
-        Bare yfinance call. Works locally always. May still be blocked on
-        Render if Yahoo is aggressive. Covers all 13 symbols. Free forever.
-        If this also fails, the symbol is skipped this cycle — not fatal.
+    TIER 1 — ScraperAPI + curl_cffi  (requires SCRAPER_API_KEY)
+    TIER 2 — plain yfinance           (always attempted, free)
     """
     cache_key = f"{symbol}_{interval}"
     hit = _cache.get(cache_key)
@@ -492,26 +326,15 @@ def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFra
         _cache[cache_key] = {"df": df, "fetched_at": datetime.now()}
         return df
 
-    # ── Tier 1: ScraperAPI proxy ──────────────────────────────────
+    # ── Tier 1: ScraperAPI + curl_cffi ───────────────────────────
     df = _fetch_scraperapi(symbol, interval, period)
     if df is not None:
         return _cache_and_return(df, "T1-ScraperAPI")
 
-    # ── Tier 2: Finnhub (US + FX + commodities only) ─────────────
-    if symbol in _FINNHUB_SYMBOLS:
-        df = _fetch_finnhub(symbol, interval)
-        if df is not None:
-            return _cache_and_return(df, "T2-Finnhub")
-
-    # ── Tier 3: yfinance + browser session ────────────────────────
-    df = _fetch_yfinance_with_session(symbol, interval, period)
-    if df is not None:
-        return _cache_and_return(df, "T3-yf-session")
-
-    # ── Tier 4: plain yfinance ────────────────────────────────────
+    # ── Tier 2: plain yfinance ────────────────────────────────────
     df = _fetch_yfinance_plain(symbol, interval, period)
     if df is not None:
-        return _cache_and_return(df, "T4-yf-plain")
+        return _cache_and_return(df, "T2-yf-plain")
 
     logger.warning("data_all_tiers_failed", symbol=symbol, interval=interval)
     return None
@@ -519,82 +342,38 @@ def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFra
 
 def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
     """
-    Get current price using the same tier priority as _fetch_ohlcv.
-
-    1. ScraperAPI → yfinance fast_info via proxy (all symbols)
-    2. Finnhub quote endpoint (US + FX + commodities)
-    3. yfinance fast_info with browser session
-    4. Last bar Close from the OHLCV already fetched (always available)
+    Get current price.
+    1. ScraperAPI + curl_cffi → yfinance fast_info (near real-time)
+    2. plain yfinance fast_info
+    3. last bar Close from OHLCV already fetched (always available)
     """
-    # ── Tier 1: ScraperAPI → yfinance fast_info ──────────────────
+    # ── Tier 1: ScraperAPI + curl_cffi ───────────────────────────
     api_key = os.getenv("SCRAPER_API_KEY", "")
     if api_key and _scraper_quota_ok():
-        proxy_url  = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-        orig_http  = os.environ.get("HTTP_PROXY",  "")
-        orig_https = os.environ.get("HTTPS_PROXY", "")
         try:
-            import ssl
-            os.environ["HTTP_PROXY"]  = proxy_url
-            os.environ["HTTPS_PROXY"] = proxy_url
-            _orig_ctx = ssl._create_default_https_context
-            ssl._create_default_https_context = ssl._create_unverified_context
-            try:
-                price = yf.Ticker(symbol).fast_info.last_price
-            finally:
-                ssl._create_default_https_context = _orig_ctx
+            from curl_cffi import requests as curl_requests
+            proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
+            session = curl_requests.Session(
+                proxies={"http": proxy_url, "https": proxy_url},
+                verify=False,
+                impersonate="chrome110",
+            )
+            price = yf.Ticker(symbol, session=session).fast_info.last_price
             if price and float(price) > 0:
                 return float(price)
         except Exception:
             pass
-        finally:
-            if orig_http:
-                os.environ["HTTP_PROXY"]  = orig_http
-            else:
-                os.environ.pop("HTTP_PROXY",  None)
-            if orig_https:
-                os.environ["HTTPS_PROXY"] = orig_https
-            else:
-                os.environ.pop("HTTPS_PROXY", None)
 
-    # ── Tier 2: Finnhub quote ─────────────────────────────────────
-    fh_key = os.getenv("FINNHUB_API_KEY", "")
-    if fh_key and symbol in _FINNHUB_SYMBOLS:
-        try:
-            fh_sym = _to_finnhub_symbol(symbol)
-            if "OANDA:" in fh_sym:
-                resp = requests.get("https://finnhub.io/api/v1/forex/candle",
-                                    params={"symbol": fh_sym, "resolution": "1",
-                                            "from": int(time.time()) - 120,
-                                            "to": int(time.time()), "token": fh_key},
-                                    timeout=5)
-            else:
-                resp = requests.get("https://finnhub.io/api/v1/quote",
-                                    params={"symbol": fh_sym, "token": fh_key}, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                price = data.get("c") or data.get("last")
-                if price and float(price) > 0:
-                    return float(price)
-        except Exception:
-            pass
-
-    # ── Tier 3: yfinance fast_info with browser session ──────────
+    # ── Tier 2: plain yfinance fast_info ─────────────────────────
     try:
-        session = requests.Session()
-        session.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
-        )
-        price = yf.Ticker(symbol, session=session).fast_info.last_price
+        price = yf.Ticker(symbol).fast_info.last_price
         if price and float(price) > 0:
             return float(price)
     except Exception:
         pass
 
-    # ── Tier 4: last bar Close (always available) ─────────────────
+    # ── Tier 3: last bar Close (always available) ─────────────────
     return float(fallback_df["Close"].iloc[-1])
-
-
 
 
 
