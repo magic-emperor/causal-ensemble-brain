@@ -193,7 +193,7 @@ _CACHE_TTL_MINUTES = 50   # re-use fetched data within same 55-min cycle
 # This prevents silent quota exhaustion — you will see a log warning instead.
 _SCRAPER_DAILY_LIMIT   = int(os.getenv("SCRAPER_DAILY_LIMIT", "900"))  # conservative
 _scraper_calls_today   = 0
-_scraper_reset_date    = datetime.utcnow().date()
+_scraper_reset_date    = datetime.now(timezone.utc).date()
 
 # ── Finnhub interval map: our intervals → Finnhub resolution codes ────────────
 # Finnhub free tier: 60 calls/min, covers US stocks + FX + commodities.
@@ -229,7 +229,7 @@ def _scraper_quota_ok() -> bool:
     Resets the counter at UTC midnight automatically.
     """
     global _scraper_calls_today, _scraper_reset_date
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     if today != _scraper_reset_date:
         _scraper_calls_today = 0
         _scraper_reset_date  = today
@@ -904,9 +904,6 @@ def start_scout(brain_key: str = ACTIVE_BRAIN_KEY,
     Deployed as a FREE Web Service on Render. Health server binds the port
     immediately so Render does not kill the process during startup.
     """
-    # ── Start health server FIRST — binds port before Render deadline ──
-    _start_health_server()
-
     # ── Validate brain key ────────────────────────────────────────
     config = PAPER_TRADE_CONFIGS.get(brain_key)
     if not config:
@@ -1007,4 +1004,9 @@ def start_scout(brain_key: str = ACTIVE_BRAIN_KEY,
 
 
 if __name__ == "__main__":
+    # ── Bind port IMMEDIATELY — before any imports, DB connections, or brain loading
+    # Render kills the process if no port is bound within 60 seconds of startup.
+    # Starting the health server here (module level) guarantees the port is bound
+    # even if start_scout() later crashes on a DB or import error.
+    _start_health_server()
     start_scout()

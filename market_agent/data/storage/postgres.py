@@ -4,8 +4,8 @@ import structlog
 from typing import Optional
 from sqlalchemy import (
     create_engine, Column, String, Integer,
-    Float as SAFloat, LargeBinary, DateTime, Index, text,
-    Numeric, BigInteger,Boolean
+    Float as SAFloat, Float, LargeBinary, DateTime, Index, text,
+    Numeric, BigInteger, Boolean
 )
 import json as _json
 from pgvector.sqlalchemy import Vector
