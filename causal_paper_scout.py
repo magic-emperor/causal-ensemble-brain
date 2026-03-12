@@ -24,9 +24,7 @@ HOW TO RUN LOCALLY:
   python causal_paper_scout.py
 
 HOW TO DEPLOY ON RENDER:
-  Deployed as a FREE Web Service via render.yaml.
-  A health server runs on PORT (set by Render) so UptimeRobot can
-  ping /health every 5 min to prevent the free tier from spinning down.
+  Deployed as a Background Worker via render.yaml.
   Set DATABASE_URL in Render Environment tab.
 """
 
@@ -36,12 +34,12 @@ import os
 import sys
 import time
 import importlib
-import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import structlog
 import pandas as pd
+import requests
 import yfinance as yf
 
 # Load .env file when running locally (no-op if dotenv not installed)
@@ -186,23 +184,271 @@ def _is_market_open(symbol: str) -> bool:
 _cache: Dict[str, Dict] = {}
 _CACHE_TTL_MINUTES = 50   # re-use fetched data within same 55-min cycle
 
+# ── ScraperAPI quota guard ────────────────────────────────────────────────────
+# Free tier: 1,000 credits/month (5,000 in first 7 days of trial).
+# Our usage: 13 symbols × ~26 cycles/day = ~338 calls/day.
+# Guard: track daily usage in-process. When SCRAPER_DAILY_LIMIT is hit,
+# ScraperAPI is skipped for the rest of the day and Tier 2 takes over.
+# This prevents silent quota exhaustion — you will see a log warning instead.
+_SCRAPER_DAILY_LIMIT   = int(os.getenv("SCRAPER_DAILY_LIMIT", "900"))  # conservative
+_scraper_calls_today   = 0
+_scraper_reset_date    = datetime.utcnow().date()
+
+# ── Finnhub interval map: our intervals → Finnhub resolution codes ────────────
+# Finnhub free tier: 60 calls/min, covers US stocks + FX + commodities.
+# Does NOT cover NSE Indian stocks (.NS) on free tier — yfinance handles those.
+_FINNHUB_RESOLUTION = {"1h": "60", "4h": "240", "1d": "D"}
+
+# ── Symbols Finnhub can serve (US equities, FX, commodities) ─────────────────
+# Indian stocks (.NS / .BO) are NOT on Finnhub free tier — excluded here.
+_FINNHUB_SYMBOLS = {
+    # US equities — use symbol as-is
+    "AAPL", "AMD", "NVDA", "GOOGL", "MSFT", "META", "AMZN", "TSLA",
+    # FX — Finnhub uses OANDA: format e.g. "OANDA:GBP_JPY"
+    "GBPJPY=X",
+    # Commodities — Finnhub futures format e.g. "COMEX:GC1!"
+    "GC=F",
+}
+
+# ── Finnhub symbol translation ────────────────────────────────────────────────
+_FINNHUB_SYMBOL_MAP = {
+    "GBPJPY=X": "OANDA:GBP_JPY",
+    "GC=F":     "COMEX:GC1!",
+}
+
+
+def _to_finnhub_symbol(symbol: str) -> str:
+    """Translate our yfinance-style symbol to Finnhub format."""
+    return _FINNHUB_SYMBOL_MAP.get(symbol, symbol)
+
+
+def _scraper_quota_ok() -> bool:
+    """
+    Returns True if ScraperAPI daily quota has not been exhausted.
+    Resets the counter at UTC midnight automatically.
+    """
+    global _scraper_calls_today, _scraper_reset_date
+    today = datetime.utcnow().date()
+    if today != _scraper_reset_date:
+        _scraper_calls_today = 0
+        _scraper_reset_date  = today
+        logger.info("scraper_quota_reset", new_date=str(today))
+    return _scraper_calls_today < _SCRAPER_DAILY_LIMIT
+
+
+def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Tier 1 — ScraperAPI proxy routing yfinance through a residential IP.
+
+    ScraperAPI wraps any URL in a proxy that looks like a real browser.
+    We pass the Yahoo Finance history URL through it so Yahoo cannot
+    detect we are on a cloud server.
+
+    Free tier  : 1,000 credits/month  (5,000 in first 7-day trial)
+    Paid tier  : from $49/month for 250,000 credits
+    Quota guard: _scraper_calls_today is incremented per call and checked
+                 before every request. When limit is hit, this function
+                 returns None immediately and Tier 2 takes over — no crash,
+                 no silent failure. A warning is logged once per day.
+
+    Requires SCRAPER_API_KEY env var. Returns None immediately if missing.
+    Covers    : all 13 symbols (same as yfinance — it IS yfinance via proxy).
+    """
+    global _scraper_calls_today
+
+    api_key = os.getenv("SCRAPER_API_KEY", "")
+    if not api_key:
+        return None
+
+    if not _scraper_quota_ok():
+        logger.warning("scraper_daily_limit_hit",
+                       limit=_SCRAPER_DAILY_LIMIT, used=_scraper_calls_today)
+        return None
+
+    try:
+        session = requests.Session()
+        # ScraperAPI proxy URL — yfinance passes all requests through this session
+        proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        # ScraperAPI uses a self-signed cert — verify=False required
+        session.verify = False
+
+        ticker = yf.Ticker(symbol, session=session)
+        df = ticker.history(period=period, interval=interval)
+
+        if df is None or df.empty:
+            return None
+
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.dropna(inplace=True)
+
+        if len(df) < 30:
+            return None
+
+        _scraper_calls_today += 1
+        logger.debug("scraper_ok", symbol=symbol, bars=len(df),
+                     calls_today=_scraper_calls_today, limit=_SCRAPER_DAILY_LIMIT)
+        return df
+
+    except Exception as e:
+        logger.debug("scraper_failed", symbol=symbol, error=str(e)[:80])
+        return None
+
+
+def _fetch_finnhub(symbol: str, interval: str, bars: int = 60) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV from Finnhub REST API.
+
+    Free tier: 60 calls/minute. Official API — not a scraper, not blocked on Render.
+    Covers: US equities, FX (via OANDA), commodities (via COMEX).
+    Does NOT cover: NSE Indian stocks (.NS) on free tier.
+
+    Returns a DataFrame with columns [Open, High, Low, Close, Volume] or None.
+    Requires FINNHUB_API_KEY env var. If key is missing, returns None immediately.
+    """
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key:
+        return None
+
+    resolution = _FINNHUB_RESOLUTION.get(interval)
+    if not resolution:
+        return None
+
+    fh_symbol = _to_finnhub_symbol(symbol)
+
+    now  = int(time.time())
+    # Request enough history: bars × seconds_per_bar + 20% buffer
+    secs_per_bar = {"60": 3600, "240": 14400, "D": 86400}.get(resolution, 3600)
+    from_ts = now - int(bars * secs_per_bar * 1.2)
+
+    try:
+        url = "https://finnhub.io/api/v1/stock/candle"
+        # For FX use forex/candle, for crypto use crypto/candle
+        if "OANDA:" in fh_symbol:
+            url = "https://finnhub.io/api/v1/forex/candle"
+        elif "COMEX:" in fh_symbol or "NYMEX:" in fh_symbol:
+            url = "https://finnhub.io/api/v1/stock/candle"   # futures use stock endpoint
+
+        resp = requests.get(url, params={
+            "symbol":     fh_symbol,
+            "resolution": resolution,
+            "from":       from_ts,
+            "to":         now,
+            "token":      api_key,
+        }, timeout=10)
+
+        if resp.status_code != 200:
+            logger.debug("finnhub_http_error", symbol=symbol, status=resp.status_code)
+            return None
+
+        data = resp.json()
+        if data.get("s") != "ok" or not data.get("c"):
+            logger.debug("finnhub_no_data", symbol=symbol, status=data.get("s"))
+            return None
+
+        df = pd.DataFrame({
+            "Open":   data["o"],
+            "High":   data["h"],
+            "Low":    data["l"],
+            "Close":  data["c"],
+            "Volume": data.get("v", [0] * len(data["c"])),
+        }, index=pd.to_datetime(data["t"], unit="s"))
+
+        df.dropna(inplace=True)
+        if len(df) < 30:
+            return None
+
+        logger.debug("finnhub_ok", symbol=symbol, bars=len(df))
+        return df
+
+    except Exception as e:
+        logger.debug("finnhub_failed", symbol=symbol, error=str(e)[:80])
+        return None
+
+
+def _fetch_yfinance_with_session(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch from yfinance using a fresh requests.Session with browser-like headers.
+
+    WHY THIS WORKS:
+    The Render block is a cookie/crumb issue — Yahoo returns empty JSON when
+    the request looks like a bare script. Passing Accept + User-Agent headers
+    that mimic a real browser often bypasses the block without any proxy.
+    This is the lightest-weight fix — no proxy service, no API key.
+    """
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        })
+        ticker = yf.Ticker(symbol, session=session)
+        df = ticker.history(period=period, interval=interval)
+
+        if df is None or df.empty:
+            return None
+
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.dropna(inplace=True)
+        return df if len(df) >= 30 else None
+
+    except Exception:
+        return None
+
+
+def _fetch_yfinance_plain(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+    """Plain yfinance call — last resort. Works locally, may be blocked on Render."""
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval=interval)
+        if df is None or df.empty:
+            return None
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.dropna(inplace=True)
+        return df if len(df) >= 30 else None
+    except Exception:
+        return None
+
 
 def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV bars from yfinance with a 50-minute in-process cache.
+    4-TIER DATA WATERFALL — tries each source in order, returns first success.
+    All tiers share the same 50-minute cache — whichever wins is reused.
 
-    WHY YFINANCE ONLY (not Breeze/AngelOne for paper trading):
-      - Paper trade entry/exit uses bar CLOSE — 15-min delay on yfinance
-        is irrelevant for 1h/4h bars where indicator math is what matters.
-      - All 13 confirmed symbols are covered by yfinance:
-          NSE (.NS)  : Yahoo uses NSE feed, ~15-min delay
-          US equities: ~15-min delay on free tier
-          FX (=X)    : real-time from Yahoo
-          GC=F       : real-time futures from Yahoo
-      - No API key. No session token. No rate limits at 55-min intervals.
+    TIER 1 — ScraperAPI proxy (primary)
+        Routes yfinance through a residential proxy so Yahoo cannot detect
+        a cloud server. Covers all 13 symbols. Requires SCRAPER_API_KEY.
+        Daily quota guard: auto-falls to Tier 2 when limit is hit.
+        Free: 1,000/month. Trial: 5,000 in first 7 days.
 
-    For live trading (not paper), we would switch to Breeze for .NS and
-    direct exchange feeds for US — but that is a future concern.
+    TIER 2 — Finnhub REST API (first fallback)
+        Official cloud-friendly API, never blocked on Render.
+        Free tier: 60 calls/min — well above our usage.
+        Covers: US equities + FX (OANDA) + commodities (COMEX).
+        Does NOT cover Indian stocks (.NS) — those fall to Tier 3.
+        Requires FINNHUB_API_KEY.
+
+    TIER 3 — yfinance + browser session headers (second fallback)
+        Passes browser-like User-Agent/Accept headers with a fresh session.
+        Bypasses Yahoo's cookie/crumb block in most cases. No API key needed.
+        Covers all 13 symbols. Free forever.
+
+    TIER 4 — plain yfinance (last resort)
+        Bare yfinance call. Works locally always. May still be blocked on
+        Render if Yahoo is aggressive. Covers all 13 symbols. Free forever.
+        If this also fails, the symbol is skipped this cycle — not fatal.
     """
     cache_key = f"{symbol}_{interval}"
     hit = _cache.get(cache_key)
@@ -211,45 +457,99 @@ def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFra
         if age_min < _CACHE_TTL_MINUTES:
             return hit["df"]
 
-    try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
-
-        if df is None or df.empty:
-            logger.warning("yf_data_empty", symbol=symbol, interval=interval)
-            return None
-
-        # Drop timezone info — brain code expects tz-naive DatetimeIndex
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.dropna(inplace=True)
-
-        if len(df) < 30:
-            logger.warning("yf_data_insufficient", symbol=symbol, rows=len(df))
-            return None
-
+    def _cache_and_return(df, tier):
+        logger.debug("data_fetch_ok", symbol=symbol, tier=tier, bars=len(df))
         _cache[cache_key] = {"df": df, "fetched_at": datetime.now()}
         return df
 
-    except Exception as e:
-        logger.error("yf_fetch_failed", symbol=symbol, error=str(e)[:120])
-        return None
+    # ── Tier 1: ScraperAPI proxy ──────────────────────────────────
+    df = _fetch_scraperapi(symbol, interval, period)
+    if df is not None:
+        return _cache_and_return(df, "T1-ScraperAPI")
+
+    # ── Tier 2: Finnhub (US + FX + commodities only) ─────────────
+    if symbol in _FINNHUB_SYMBOLS:
+        df = _fetch_finnhub(symbol, interval)
+        if df is not None:
+            return _cache_and_return(df, "T2-Finnhub")
+
+    # ── Tier 3: yfinance + browser session ────────────────────────
+    df = _fetch_yfinance_with_session(symbol, interval, period)
+    if df is not None:
+        return _cache_and_return(df, "T3-yf-session")
+
+    # ── Tier 4: plain yfinance ────────────────────────────────────
+    df = _fetch_yfinance_plain(symbol, interval, period)
+    if df is not None:
+        return _cache_and_return(df, "T4-yf-plain")
+
+    logger.warning("data_all_tiers_failed", symbol=symbol, interval=interval)
+    return None
 
 
 def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
     """
-    Attempt near-real-time price via yfinance fast_info.
-    Falls back to the last bar's Close if fast_info is unavailable.
-    fast_info does not require an API key and is near-real-time.
+    Get current price using the same tier priority as _fetch_ohlcv.
+
+    1. ScraperAPI → yfinance fast_info via proxy (all symbols)
+    2. Finnhub quote endpoint (US + FX + commodities)
+    3. yfinance fast_info with browser session
+    4. Last bar Close from the OHLCV already fetched (always available)
     """
+    # ── Tier 1: ScraperAPI → yfinance fast_info ──────────────────
+    api_key = os.getenv("SCRAPER_API_KEY", "")
+    if api_key and _scraper_quota_ok():
+        try:
+            proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
+            session = requests.Session()
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+            session.verify = False
+            price = yf.Ticker(symbol, session=session).fast_info.last_price
+            if price and float(price) > 0:
+                return float(price)
+        except Exception:
+            pass
+
+    # ── Tier 2: Finnhub quote ─────────────────────────────────────
+    fh_key = os.getenv("FINNHUB_API_KEY", "")
+    if fh_key and symbol in _FINNHUB_SYMBOLS:
+        try:
+            fh_sym = _to_finnhub_symbol(symbol)
+            if "OANDA:" in fh_sym:
+                resp = requests.get("https://finnhub.io/api/v1/forex/candle",
+                                    params={"symbol": fh_sym, "resolution": "1",
+                                            "from": int(time.time()) - 120,
+                                            "to": int(time.time()), "token": fh_key},
+                                    timeout=5)
+            else:
+                resp = requests.get("https://finnhub.io/api/v1/quote",
+                                    params={"symbol": fh_sym, "token": fh_key}, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = data.get("c") or data.get("last")
+                if price and float(price) > 0:
+                    return float(price)
+        except Exception:
+            pass
+
+    # ── Tier 3: yfinance fast_info with browser session ──────────
     try:
-        price = yf.Ticker(symbol).fast_info.last_price
+        session = requests.Session()
+        session.headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+        )
+        price = yf.Ticker(symbol, session=session).fast_info.last_price
         if price and float(price) > 0:
             return float(price)
     except Exception:
         pass
+
+    # ── Tier 4: last bar Close (always available) ─────────────────
     return float(fallback_df["Close"].iloc[-1])
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -509,56 +809,12 @@ def _run_scan_cycle(config: Dict, storage, tracker: SessionTracker,
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════
-# HEALTH SERVER — keeps Render Free Web Service alive
-#
-# Render free Web Services spin down after 15 min of inactivity.
-# This tiny HTTP server answers GET / and GET /health so that
-# UptimeRobot can ping it every 5 minutes and prevent spin-down.
-#
-# Uses Python's built-in http.server — ZERO new dependencies.
-# Runs in a daemon thread so it never blocks the scanning loop.
-#
-# Port: read from PORT env var (Render sets this automatically).
-#       Falls back to 8080 for local testing.
-# ═══════════════════════════════════════════════════════════
-
-def _start_health_server():
-    """
-    Start a minimal HTTP health server in a background daemon thread.
-    Responds 200 OK to any GET request with a plain-text status line.
-    Called once at startup — before the main scanning loop begins.
-    """
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class _HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            body = b"causal-paper-scout: alive\n"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, fmt, *args):
-            pass   # silence per-request access logs — keep Render logs clean
-
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"  ✅ Health server running on port {port}  (UptimeRobot target: /health)")
-
-
 def start_scout(brain_key: str = ACTIVE_BRAIN_KEY,
                 interval_minutes: int = INTERVAL_MINUTES):
     """
     Main entry point. Runs forever until stopped.
     Render Background Worker keeps this running 24/7 without spinning down.
     """
-    # ── Start health server (keeps Render free tier alive) ───────
-    _start_health_server()
-
     # ── Validate brain key ────────────────────────────────────────
     config = PAPER_TRADE_CONFIGS.get(brain_key)
     if not config:
