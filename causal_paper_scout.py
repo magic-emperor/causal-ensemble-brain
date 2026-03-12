@@ -244,6 +244,13 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
     We pass the Yahoo Finance history URL through it so Yahoo cannot
     detect we are on a cloud server.
 
+    HOW THE PROXY IS SET:
+    yfinance uses urllib3 internally and does NOT respect session.proxies
+    or session.verify when passed a custom requests.Session. The correct
+    approach is to set HTTP_PROXY / HTTPS_PROXY as process-level environment
+    variables before calling yfinance, then restore the originals after.
+    This is the only method that reliably works with yfinance on cloud servers.
+
     Free tier  : 1,000 credits/month  (5,000 in first 7-day trial)
     Paid tier  : from $49/month for 250,000 credits
     Quota guard: _scraper_calls_today is incremented per call and checked
@@ -265,16 +272,27 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
                        limit=_SCRAPER_DAILY_LIMIT, used=_scraper_calls_today)
         return None
 
-    try:
-        session = requests.Session()
-        # ScraperAPI proxy URL — yfinance passes all requests through this session
-        proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-        session.proxies = {"http": proxy_url, "https": proxy_url}
-        # ScraperAPI uses a self-signed cert — verify=False required
-        session.verify = False
+    proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
 
-        ticker = yf.Ticker(symbol, session=session)
-        df = ticker.history(period=period, interval=interval)
+    # Save originals to restore after — never leave proxy set globally
+    orig_http  = os.environ.get("HTTP_PROXY",  "")
+    orig_https = os.environ.get("HTTPS_PROXY", "")
+
+    try:
+        # Set proxy at process level — the only way yfinance/urllib3 respects it
+        os.environ["HTTP_PROXY"]  = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+
+        # Disable SSL verification for ScraperAPI's self-signed cert
+        import ssl
+        _orig_ctx = ssl._create_default_https_context
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval=interval)
+        finally:
+            # Always restore SSL context even if yfinance throws
+            ssl._create_default_https_context = _orig_ctx
 
         if df is None or df.empty:
             return None
@@ -296,6 +314,17 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
     except Exception as e:
         logger.debug("scraper_failed", symbol=symbol, error=str(e)[:80])
         return None
+
+    finally:
+        # Always restore original proxy env vars
+        if orig_http:
+            os.environ["HTTP_PROXY"]  = orig_http
+        else:
+            os.environ.pop("HTTP_PROXY",  None)
+        if orig_https:
+            os.environ["HTTPS_PROXY"] = orig_https
+        else:
+            os.environ.pop("HTTPS_PROXY", None)
 
 
 def _fetch_finnhub(symbol: str, interval: str, bars: int = 60) -> Optional[pd.DataFrame]:
@@ -499,16 +528,32 @@ def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
     # ── Tier 1: ScraperAPI → yfinance fast_info ──────────────────
     api_key = os.getenv("SCRAPER_API_KEY", "")
     if api_key and _scraper_quota_ok():
+        proxy_url  = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
+        orig_http  = os.environ.get("HTTP_PROXY",  "")
+        orig_https = os.environ.get("HTTPS_PROXY", "")
         try:
-            proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-            session = requests.Session()
-            session.proxies = {"http": proxy_url, "https": proxy_url}
-            session.verify = False
-            price = yf.Ticker(symbol, session=session).fast_info.last_price
+            import ssl
+            os.environ["HTTP_PROXY"]  = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            _orig_ctx = ssl._create_default_https_context
+            ssl._create_default_https_context = ssl._create_unverified_context
+            try:
+                price = yf.Ticker(symbol).fast_info.last_price
+            finally:
+                ssl._create_default_https_context = _orig_ctx
             if price and float(price) > 0:
                 return float(price)
         except Exception:
             pass
+        finally:
+            if orig_http:
+                os.environ["HTTP_PROXY"]  = orig_http
+            else:
+                os.environ.pop("HTTP_PROXY",  None)
+            if orig_https:
+                os.environ["HTTPS_PROXY"] = orig_https
+            else:
+                os.environ.pop("HTTPS_PROXY", None)
 
     # ── Tier 2: Finnhub quote ─────────────────────────────────────
     fh_key = os.getenv("FINNHUB_API_KEY", "")
