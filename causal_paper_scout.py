@@ -34,6 +34,7 @@ import os
 import sys
 import time
 import importlib
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
@@ -851,6 +852,48 @@ def _run_scan_cycle(config: Dict, storage, tracker: SessionTracker,
 
 
 # ═══════════════════════════════════════════════════════════
+# HEALTH SERVER — keeps Render Free Web Service alive
+#
+# Render free Web Services spin down after 15 min of inactivity.
+# This tiny HTTP server answers GET /health so UptimeRobot can
+# ping every 5 minutes and prevent spin-down.
+#
+# CRITICAL: Must bind to PORT before Render's 60-second deadline
+# or Render marks the deploy as failed. We start this FIRST,
+# before any DB connection or brain loading.
+#
+# Uses Python built-in http.server — ZERO new dependencies.
+# Runs in a daemon thread so it never blocks the scan loop.
+# ═══════════════════════════════════════════════════════════
+
+def _start_health_server():
+    """
+    Start a minimal HTTP health server in a background daemon thread.
+    Responds 200 OK to any GET request.
+    Called as the very first thing in start_scout() — before DB, before brain.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"causal-paper-scout: alive\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass  # silence per-request access logs
+
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"  ✅ Health server running on port {port}  (UptimeRobot target: /health)")
+
+
+# ═══════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════
 
@@ -858,8 +901,12 @@ def start_scout(brain_key: str = ACTIVE_BRAIN_KEY,
                 interval_minutes: int = INTERVAL_MINUTES):
     """
     Main entry point. Runs forever until stopped.
-    Render Background Worker keeps this running 24/7 without spinning down.
+    Deployed as a FREE Web Service on Render. Health server binds the port
+    immediately so Render does not kill the process during startup.
     """
+    # ── Start health server FIRST — binds port before Render deadline ──
+    _start_health_server()
+
     # ── Validate brain key ────────────────────────────────────────
     config = PAPER_TRADE_CONFIGS.get(brain_key)
     if not config:
