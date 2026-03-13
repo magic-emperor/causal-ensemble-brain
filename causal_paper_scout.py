@@ -181,23 +181,19 @@ def _is_market_open(symbol: str) -> bool:
 # ═══════════════════════════════════════════════════════════
 # DATA FETCHING — 2-tier waterfall, tested locally before deploy
 #
-# WHAT WE LEARNED FROM LOCAL TESTING (test_data_tiers.py):
+# DATA WATERFALL (proven by local testing):
 #
-#   Tier 1 — ScraperAPI + curl_cffi session  ← PRIMARY
-#     Modern yfinance (>=0.2.50) requires curl_cffi, not requests.Session.
-#     ScraperAPI routes through residential IPs that Yahoo does not block.
-#     Requires: SCRAPER_API_KEY env var + curl_cffi in requirements.
+#   .NS Indian stocks (ADANIENT, ADANIPORTS, LT):
+#     Tier 1 -- Breeze (ICICI Direct API) -- real exchange data, no blocks
+#     Tier 2 -- ScraperAPI -- direct Yahoo v8 via requests proxy
+#     Tier 3 -- plain yfinance -- local only, blocked on Render cloud IPs
 #
-#   Tier 2 — plain yfinance                  ← FALLBACK
-#     Works perfectly locally. May fail on Render cloud IPs (Yahoo blocks).
-#     No key needed. Used when ScraperAPI key missing or quota exhausted.
-#     If this also fails on Render, symbol is skipped this cycle — not fatal.
+#   US/FX/Commodities (AAPL, AMD, NVDA etc, GBPJPY, GC=F):
+#     Tier 1 -- ScraperAPI -- direct Yahoo v8 via requests proxy (PROVEN)
+#     Tier 2 -- plain yfinance -- fallback, works locally
 #
-#   REMOVED — Finnhub:
-#     403 on free tier. OHLCV candles require paid plan. Not viable.
-#
-#   REMOVED — yfinance + requests.Session:
-#     yfinance now rejects requests.Session. Needs curl_cffi. Removed.
+#   REMOVED -- Finnhub: 403 on free tier, OHLCV requires paid plan
+#   REMOVED -- yfinance+session: triggers cookie bug #2470
 # ═══════════════════════════════════════════════════════════
 
 _cache: Dict[str, Dict] = {}
@@ -222,15 +218,16 @@ def _scraper_quota_ok() -> bool:
 
 def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
     """
-    TIER 1 — ScraperAPI proxy with curl_cffi session.
+    TIER 1 -- Yahoo Finance v8 API via requests + ScraperAPI proxy.
 
-    WHY curl_cffi:
-      Modern yfinance (>=0.2.50) internally uses curl_cffi for HTTP and
-      rejects plain requests.Session with 'Yahoo API requires curl_cffi session'.
-      We create a curl_cffi session configured with ScraperAPI's proxy so
-      yfinance routes all Yahoo requests through a residential IP.
+    WHY direct requests instead of yfinance:
+      - yfinance curl_cffi ignores HTTP_PROXY/HTTPS_PROXY env vars
+      - Any custom session passed to yfinance triggers cookie bug #2470:
+        'str object has no attribute name'
+      - Direct requests call PROVEN working locally:
+        Status 200, 32 bars via ScraperAPI (see test_scraper_debug.py)
 
-    Quota guard: auto-falls to Tier 2 when daily limit hit.
+    Quota guard: falls to Tier 2 when daily limit hit.
     Requires: SCRAPER_API_KEY env var.
     """
     global _scraper_calls_today
@@ -244,31 +241,56 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
                        limit=_SCRAPER_DAILY_LIMIT, used=_scraper_calls_today)
         return None
 
+    _PERIOD_TO_RANGE = {
+        "5d": "5d", "7d": "7d", "30d": "1mo", "60d": "3mo",
+        "90d": "3mo", "1mo": "1mo", "3mo": "3mo", "6mo": "6mo",
+    }
+    yf_range  = _PERIOD_TO_RANGE.get(period, period)
+    proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
+    url       = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+
     try:
-        from curl_cffi import requests as curl_requests
-
-        proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-
-        # curl_cffi session — the only session type yfinance accepts
-        session = curl_requests.Session(
+        resp = requests.get(
+            url,
+            params={"interval": interval, "range": yf_range},
             proxies={"http": proxy_url, "https": proxy_url},
-            verify=False,   # ScraperAPI uses self-signed cert
-            impersonate="chrome110",  # mimics real browser TLS fingerprint
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/122.0.0.0 Safari/537.36"},
+            verify=False,
+            timeout=20,
         )
 
-        ticker = yf.Ticker(symbol, session=session)
-        df = ticker.history(period=period, interval=interval)
-
-        if df is None or df.empty:
+        if resp.status_code != 200:
+            logger.debug("scraper_yahoo_http_error",
+                         symbol=symbol, status=resp.status_code)
             return None
 
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        data   = resp.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            logger.debug("scraper_yahoo_no_result", symbol=symbol)
+            return None
 
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        result     = result[0]
+        timestamps = result.get("timestamp", [])
+        ohlcv      = result.get("indicators", {}).get("quote", [{}])[0]
+
+        if not timestamps or not ohlcv.get("close"):
+            return None
+
+        df = pd.DataFrame({
+            "Open":   ohlcv.get("open",   [None] * len(timestamps)),
+            "High":   ohlcv.get("high",   [None] * len(timestamps)),
+            "Low":    ohlcv.get("low",    [None] * len(timestamps)),
+            "Close":  ohlcv.get("close",  [None] * len(timestamps)),
+            "Volume": ohlcv.get("volume", [0]    * len(timestamps)),
+        }, index=pd.to_datetime(timestamps, unit="s"))
+
         df.dropna(inplace=True)
 
         if len(df) < 30:
+            logger.debug("scraper_too_few_bars", symbol=symbol, bars=len(df))
             return None
 
         _scraper_calls_today += 1
@@ -276,12 +298,150 @@ def _fetch_scraperapi(symbol: str, interval: str, period: str) -> Optional[pd.Da
                      calls_today=_scraper_calls_today)
         return df
 
-    except ImportError:
-        logger.warning("curl_cffi_missing",
-                       msg="Install curl_cffi in requirements_scout.txt")
-        return None
     except Exception as e:
         logger.debug("scraper_failed", symbol=symbol, error=str(e)[:120])
+        return None
+
+
+
+def _fetch_breeze(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Breeze (ICICI Direct) -- used ONLY for Indian NSE stocks (.NS).
+
+    WHY Breeze for Indian stocks:
+      Breeze connects directly to NSE exchange feed -- no IP blocking,
+      no rate limits for our usage, real OHLCV data.
+      ScraperAPI/yfinance both struggle with .NS on cloud IPs.
+
+    Interval mapping:
+      yfinance "1h"  -> Breeze "1hour"
+      yfinance "4h"  -> Breeze "1hour" (resampled to 4h after fetch)
+      yfinance "1d"  -> Breeze "1day"
+
+    Period -> days mapping:
+      "30d" -> 30 days back, "60d" -> 60, "90d" -> 90, "5d" -> 5
+
+    Requires: BREEZE_API_KEY, BREEZE_SECRET, BREEZE_SESSION_TOKEN env vars.
+    Token expires daily -- must be refreshed manually in Render dashboard.
+    """
+    # Only for Indian stocks
+    if ".NS" not in symbol and ".BO" not in symbol:
+        return None
+
+    api_key   = os.getenv("BREEZE_API_KEY", "")
+    secret    = os.getenv("BREEZE_SECRET", "")
+    token     = os.getenv("BREEZE_SESSION_TOKEN", "")
+
+    if not api_key or not secret or not token:
+        logger.debug("breeze_keys_missing", symbol=symbol)
+        return None
+
+    try:
+        from breeze_connect import BreezeConnect
+
+        breeze = BreezeConnect(api_key=api_key)
+        breeze.generate_session(api_secret=secret, session_token=token)
+
+        # Breeze uses its own internal isec_stock_code, NOT the NSE ticker.
+        # Confirmed via breeze.get_names() -- do NOT change these mappings.
+        # exchange_stock_code (NSE) -> isec_stock_code (Breeze internal)
+        _BREEZE_CODE_MAP = {
+            "ADANIENT":  "ADAENT",
+            "ADANIPORTS": "ADAPOR",
+            "LT":        "LARTOU",
+        }
+        exchange    = "NSE" if ".NS" in symbol else "BSE"
+        nse_ticker  = symbol.replace(".NS", "").replace(".BO", "")
+        bare_symbol = _BREEZE_CODE_MAP.get(nse_ticker, nse_ticker)
+
+        if bare_symbol == nse_ticker and nse_ticker not in _BREEZE_CODE_MAP:
+            logger.warning("breeze_unmapped_symbol", symbol=symbol,
+                           msg="Add isec_stock_code to _BREEZE_CODE_MAP via get_names()")
+
+        # Interval mapping
+        # Valid Breeze intervals: '1second','1minute','5minute','30minute','1day'
+        # '1hour' is NOT valid. Use '30minute' and resample to 1h/4h after fetch.
+        _INTERVAL_MAP = {"1h": "30minute", "4h": "30minute", "1d": "1day"}
+        breeze_interval = _INTERVAL_MAP.get(interval, "30minute")
+
+        # Period -> days
+        _PERIOD_DAYS = {
+            "5d": 5, "7d": 7, "30d": 30, "60d": 60,
+            "90d": 90, "1mo": 30, "3mo": 90, "6mo": 180,
+        }
+        days = _PERIOD_DAYS.get(period, 30)
+
+        from_dt = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00.000Z")
+        to_dt   = datetime.now().strftime("%Y-%m-%dT23:59:59.000Z")
+
+        resp = breeze.get_historical_data_v2(
+            interval=breeze_interval,
+            from_date=from_dt,
+            to_date=to_dt,
+            stock_code=bare_symbol,
+            exchange_code=exchange,
+            product_type="Cash",
+        )
+
+        if not resp or resp.get("Status") != 200:
+            err = resp.get("Error", "unknown") if resp else "no response"
+            # Check if token is stale -- most common failure
+            if "session" in str(err).lower() or "token" in str(err).lower() or "auth" in str(err).lower():
+                logger.warning("breeze_token_expired",
+                               symbol=symbol,
+                               msg="Refresh BREEZE_SESSION_TOKEN in Render dashboard")
+            else:
+                logger.debug("breeze_api_error", symbol=symbol, error=str(err)[:80])
+            return None
+
+        rows = resp.get("Success", [])
+        if not rows:
+            logger.debug("breeze_no_rows", symbol=symbol)
+            return None
+
+        df = pd.DataFrame(rows)
+
+        # Breeze column names vary -- normalize
+        # Confirmed column names from live Breeze response (test_breeze_cols.py):
+        # ['close', 'datetime', 'exchange_code', 'high', 'low', 'open', 'stock_code', 'volume']
+        df.index = pd.to_datetime(df["datetime"])
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        df = df.apply(pd.to_numeric, errors="coerce")
+        df.dropna(inplace=True)
+        df.sort_index(inplace=True)
+
+        # Breeze returns 30min bars -- resample to target interval
+        # For 1h: aggregate pairs of 30min bars
+        # For 4h: aggregate 8x 30min bars
+        # For 1d: already daily, no resample needed
+        if interval in ("1h", "4h"):
+            resample_rule = "1h" if interval == "1h" else "4h"
+            df = df.resample(resample_rule).agg({
+                "Open": "first", "High": "max",
+                "Low": "min",   "Close": "last", "Volume": "sum",
+            }).dropna()
+
+        if len(df) < 10:
+            logger.debug("breeze_too_few_bars", symbol=symbol, bars=len(df))
+            return None
+
+        logger.debug("breeze_ok", symbol=symbol, bars=len(df),
+                     interval=interval, exchange=exchange)
+        return df
+
+    except ImportError:
+        logger.warning("breeze_not_installed",
+                       msg="Add breeze-connect to requirements_scout.txt")
+        return None
+    except Exception as e:
+        err_str = str(e)
+        if "session" in err_str.lower() or "token" in err_str.lower():
+            logger.warning("breeze_token_expired",
+                           symbol=symbol,
+                           msg="Refresh BREEZE_SESSION_TOKEN in Render dashboard")
+        else:
+            logger.debug("breeze_failed", symbol=symbol, error=err_str[:120])
         return None
 
 
@@ -326,15 +486,31 @@ def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFra
         _cache[cache_key] = {"df": df, "fetched_at": datetime.now()}
         return df
 
-    # ── Tier 1: ScraperAPI + curl_cffi ───────────────────────────
-    df = _fetch_scraperapi(symbol, interval, period)
-    if df is not None:
-        return _cache_and_return(df, "T1-ScraperAPI")
+    is_indian = ".NS" in symbol or ".BO" in symbol
 
-    # ── Tier 2: plain yfinance ────────────────────────────────────
-    df = _fetch_yfinance_plain(symbol, interval, period)
-    if df is not None:
-        return _cache_and_return(df, "T2-yf-plain")
+    if is_indian:
+        # Indian stocks: Breeze first (real exchange data), then fallbacks
+        df = _fetch_breeze(symbol, interval, period)
+        if df is not None:
+            return _cache_and_return(df, "T1-Breeze")
+
+        df = _fetch_scraperapi(symbol, interval, period)
+        if df is not None:
+            return _cache_and_return(df, "T2-ScraperAPI")
+
+        df = _fetch_yfinance_plain(symbol, interval, period)
+        if df is not None:
+            return _cache_and_return(df, "T3-yf-plain")
+
+    else:
+        # US / FX / Commodities: ScraperAPI first, plain yfinance fallback
+        df = _fetch_scraperapi(symbol, interval, period)
+        if df is not None:
+            return _cache_and_return(df, "T1-ScraperAPI")
+
+        df = _fetch_yfinance_plain(symbol, interval, period)
+        if df is not None:
+            return _cache_and_return(df, "T2-yf-plain")
 
     logger.warning("data_all_tiers_failed", symbol=symbol, interval=interval)
     return None
@@ -343,28 +519,34 @@ def _fetch_ohlcv(symbol: str, interval: str, period: str) -> Optional[pd.DataFra
 def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
     """
     Get current price.
-    1. ScraperAPI + curl_cffi → yfinance fast_info (near real-time)
+    1. ScraperAPI -- Yahoo quote endpoint via requests (direct, no yfinance)
     2. plain yfinance fast_info
     3. last bar Close from OHLCV already fetched (always available)
     """
-    # ── Tier 1: ScraperAPI + curl_cffi ───────────────────────────
+    # -- Tier 1: ScraperAPI direct Yahoo quote via requests ---
     api_key = os.getenv("SCRAPER_API_KEY", "")
     if api_key and _scraper_quota_ok():
+        proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
         try:
-            from curl_cffi import requests as curl_requests
-            proxy_url = f"http://scraperapi:{api_key}@proxy-server.scraperapi.com:8001"
-            session = curl_requests.Session(
+            resp = requests.get(
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+                params={"interval": "1m", "range": "1d"},
                 proxies={"http": proxy_url, "https": proxy_url},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36"},
                 verify=False,
-                impersonate="chrome110",
+                timeout=10,
             )
-            price = yf.Ticker(symbol, session=session).fast_info.last_price
-            if price and float(price) > 0:
-                return float(price)
+            if resp.status_code == 200:
+                result = resp.json().get("chart", {}).get("result", [{}])[0]
+                meta   = result.get("meta", {})
+                price  = meta.get("regularMarketPrice") or meta.get("previousClose")
+                if price and float(price) > 0:
+                    return float(price)
         except Exception:
             pass
 
-    # ── Tier 2: plain yfinance fast_info ─────────────────────────
+    # -- Tier 2: plain yfinance fast_info ---
     try:
         price = yf.Ticker(symbol).fast_info.last_price
         if price and float(price) > 0:
@@ -372,8 +554,9 @@ def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
     except Exception:
         pass
 
-    # ── Tier 3: last bar Close (always available) ─────────────────
+    # -- Tier 3: last bar Close (always available) ---
     return float(fallback_df["Close"].iloc[-1])
+
 
 
 
