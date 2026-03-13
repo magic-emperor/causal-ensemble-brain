@@ -9,13 +9,53 @@
 # ═══════════════════════════════════════════════════════════
 
 # ── Data & Math ─────────────────────────────────────────────
-numpy==1.26.4
-scipy==1.13.1
-pandas==2.2.2
-yfinance==0.2.40
+# numpy==1.26.4
+# scipy==1.13.1
+# pandas==2.2.2
+# yfinance==0.2.40
 
 # ── HTTP — curl_cffi required by modern yfinance ─────────────
-curl_cffi==0.7.4
+# curl_cffi==0.7.4
+
+# ── Database ────────────────────────────────────────────────
+# sqlalchemy==2.0.31
+# psycopg2-binary==2.9.9
+# pgvector==0.3.2
+
+# ── Logging ─────────────────────────────────────────────────
+# structlog==24.2.0
+
+# ── Environment ─────────────────────────────────────────────
+# python-dotenv==1.0.1
+
+# ── HTTP / Network ───────────────────────────────────────────
+# requests==2.32.3
+# urllib3==2.2.2
+
+# ── Misc yfinance dependencies ───────────────────────────────
+# multitasking==0.0.11
+# frozendict==2.4.4
+# peewee==3.17.6
+# beautifulsoup4==4.12.3
+# html5lib==1.1
+# lxml==5.2.2
+
+
+
+# ═══════════════════════════════════════════════════════════
+# Causal-Ensemble Paper Scout — Python Dependencies
+#
+# TARGET: Python 3.11.9 (set PYTHON_VERSION=3.11.9 in Render dashboard)
+#
+# NO torch. NO sentence-transformers. NO heavy ML.
+# NO scipy/numpy listed directly — pulled in by pandas/yfinance.
+# NO curl_cffi listed directly — pulled in by yfinance internally.
+# Listing scipy/numpy/curl_cffi manually caused source compilation hangs.
+# ═══════════════════════════════════════════════════════════
+
+# ── Data & Math ─────────────────────────────────────────────
+pandas==2.2.2
+yfinance==0.2.40
 
 # ── Database ────────────────────────────────────────────────
 sqlalchemy==2.0.31
@@ -31,11 +71,3 @@ python-dotenv==1.0.1
 # ── HTTP / Network ───────────────────────────────────────────
 requests==2.32.3
 urllib3==2.2.2
-
-# ── Misc yfinance dependencies ───────────────────────────────
-multitasking==0.0.11
-frozendict==2.4.4
-peewee==3.17.6
-beautifulsoup4==4.12.3
-html5lib==1.1
-lxml==5.2.2
