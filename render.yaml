@@ -2,13 +2,9 @@
 # Render Deployment Config — Causal Paper Scout
 #
 # Service type: web (Free Web Service)
-# WHY web not worker: Background Workers cost money on Render.
-# Free Web Services are free but spin down after 15 min of
-# inactivity. We solve this by:
-#   1. causal_paper_scout.py runs a tiny health server on PORT
-#   2. UptimeRobot pings /health every 5 min (free) -> no spin-down
-#
-# Database: PostgreSQL 16 (pgvector requires Postgres 15+)
+# Python: 3.11.9 — explicitly pinned. Render's default is now
+#   Python 3.14 which has no pre-built wheels for scipy/numpy.
+#   Also enforced via .python-version file in repo root.
 # ═══════════════════════════════════════════════════════════
 
 services:
@@ -17,22 +13,23 @@ services:
     runtime: python
     repo: https://github.com/magic-emperor/causal-ensemble-brain
     branch: main
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements_scout.txt
     startCommand: python causal_paper_scout.py
     plan: free
     envVars:
-      # Render auto-populates this from the database block below
       - key: DATABASE_URL
         fromDatabase:
           name: causal-scout-db
           property: connectionString
-      # Which brain config to run (matches key in PAPER_TRADE_CONFIGS)
       - key: PAPER_SCOUT_BRAIN
         value: causal_ensemble
-      # Scan interval in minutes
       - key: PAPER_SCOUT_INTERVAL_MIN
         value: "55"
-      # ICICI Breeze -- add real values in Render dashboard (sync: false = manual)
+      - key: SCRAPER_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
       - key: BREEZE_API_KEY
         sync: false
       - key: BREEZE_SECRET

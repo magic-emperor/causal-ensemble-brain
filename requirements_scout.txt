@@ -1,18 +1,16 @@
 # ═══════════════════════════════════════════════════════════
 # Causal-Ensemble Paper Scout — Python Dependencies
 #
-# NO torch. NO sentence-transformers. NO heavy ML.
-# Estimated Render RAM usage: ~150 MB (well within 512 MB free tier)
+# TARGET: Python 3.11.9 (pinned via .python-version file)
+# Python 3.14 is Render's new default — has NO wheels for
+# scipy, numpy, or most scientific packages. Must use 3.11.
 #
-# Install locally:
-#     pip install -r requirements_scout.txt
+# NO torch. NO sentence-transformers. NO heavy ML.
 # ═══════════════════════════════════════════════════════════
 
 # ── Data & Math ─────────────────────────────────────────────
-# numpy and scipy MUST be pinned to versions with pre-built wheels
-# for Python 3.11 AND 3.12. Older pins caused source compilation hang.
-numpy==2.2.4
-scipy==1.15.2
+numpy==1.26.4
+scipy==1.13.1
 pandas==2.2.2
 yfinance==0.2.40
 
