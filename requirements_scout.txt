@@ -41,21 +41,21 @@
 # lxml==5.2.2
 
 
-
 # ═══════════════════════════════════════════════════════════
 # Causal-Ensemble Paper Scout — Python Dependencies
 #
-# TARGET: Python 3.11.9 (set PYTHON_VERSION=3.11.9 in Render dashboard)
+# TARGET: Python 3.11.9
+# Set PYTHON_VERSION=3.11.9 in Render dashboard Environment tab.
 #
-# NO torch. NO sentence-transformers. NO heavy ML.
-# NO scipy/numpy listed directly — pulled in by pandas/yfinance.
-# NO curl_cffi listed directly — pulled in by yfinance internally.
-# Listing scipy/numpy/curl_cffi manually caused source compilation hangs.
+# NO torch. NO heavy ML. Estimated RAM: ~160 MB
 # ═══════════════════════════════════════════════════════════
 
 # ── Data & Math ─────────────────────────────────────────────
 pandas==2.2.2
 yfinance==0.2.40
+
+# ── Breeze (ICICI Direct) -- Indian stocks only ──────────────
+breeze-connect==1.0.68
 
 # ── Database ────────────────────────────────────────────────
 sqlalchemy==2.0.31
